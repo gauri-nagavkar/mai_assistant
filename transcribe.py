@@ -1,6 +1,11 @@
 import sys
 import whisper
-from transformers import pipeline
+import nltk
+import ollama
+from nltk.tokenize import sent_tokenize
+
+# Download necessary NLTK data
+nltk.download('punkt')
 
 def transcribe_audio(audio_path: str) -> str:
     """
@@ -10,50 +15,82 @@ def transcribe_audio(audio_path: str) -> str:
     result = model.transcribe(audio_path)
     return result["text"]
 
-def chunk_text(text: str, tokenizer, max_tokens: int) -> list:
+def better_chunk_text(text: str, tokenizer, max_tokens: int) -> list:
     """
-    Splits text into chunks that do not exceed max_tokens.
-    Uses a tokenizer to properly split and then decodes each chunk.
+    Splits text into chunks without breaking sentences.
+    Uses NLTK's sent_tokenize to split the transcript into sentences,
+    then aggregates sentences until the token count reaches max_tokens.
     """
-    # Get token IDs without special tokens
-    tokens = tokenizer.encode(text, add_special_tokens=False)
+    sentences = sent_tokenize(text)
     chunks = []
-    for i in range(0, len(tokens), max_tokens):
-        chunk_tokens = tokens[i:i+max_tokens]
-        chunk = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-        chunks.append(chunk)
+    current_chunk = ""
+
+    for sentence in sentences:
+        candidate_chunk = f"{current_chunk} {sentence}".strip() if current_chunk else sentence
+        tokens = tokenizer(candidate_chunk)
+
+        if len(tokens) <= max_tokens:
+            current_chunk = candidate_chunk
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
     return chunks
 
 def summarize_text(text: str) -> str:
     """
-    Summarizes the text using a summarization pipeline.
-    If the text exceeds the model's max input tokens (with a safety buffer),
-    it is split into manageable chunks.
+    Summarizes the text using a locally running LLM via Ollama (Mistral-7B).
     """
-    summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-    tokenizer = summarizer.tokenizer
-    max_input_length = tokenizer.model_max_length  # typically 1024 tokens for BART
-    # Leave a safety buffer to avoid hitting the absolute maximum.
-    safe_max_length = max_input_length - 10
+    prompt = (
+        "Summarize the following transcript concisely. "
+        "Preserve key decisions, discussions, and important points but omit general chatter.\n\n"
+        f"Transcript:\n{text}"
+    )
 
-    # Tokenize the input without special tokens
-    tokens = tokenizer.encode(text, add_special_tokens=False)
-    if len(tokens) > safe_max_length:
-        print(f"Input is too long ({len(tokens)} tokens). Splitting into chunks...")
-        chunks = chunk_text(text, tokenizer, safe_max_length)
-        summaries = []
+    response = ollama.chat(model="mistral", messages=[{"role": "user", "content": prompt}])
+    return response['message']['content'].strip()
+
+def extract_action_items(text: str) -> list:
+    """
+    Extracts action items from the transcript using a local AI model (Mistral-7B via Ollama).
+    If the transcript is too long, it is chunked before processing.
+    """
+    max_tokens = 2048  # Mistral-7B token limit per request
+
+    def tokenize(t): return ollama.chat(model="mistral", messages=[{"role": "user", "content": t}])['message']['content'].split()
+
+    tokens = tokenize(text)
+    action_items = []
+
+    if len(tokens) > max_tokens:
+        print(f"Transcript is too long ({len(tokens)} tokens). Splitting into chunks...")
+        chunks = better_chunk_text(text, tokenize, max_tokens)
+
         for i, chunk in enumerate(chunks):
-            print(f"Summarizing chunk {i+1}/{len(chunks)}...")
-            summary_chunk = summarizer(chunk, max_length=150, min_length=30, do_sample=False)
-            summaries.append(summary_chunk[0]['summary_text'])
-        # Combine the summaries from all chunks.
-        combined_summary = " ".join(summaries)
-        print("Summarizing the combined summary...")
-        final_summary = summarizer(combined_summary, max_length=150, min_length=30, do_sample=False)
-        return final_summary[0]['summary_text']
+            print(f"Extracting action items from chunk {i+1}/{len(chunks)}...")
+            prompt = (
+                "Extract the past, current and future action items from the following meeting transcript. "
+                "Only include key tasks (new, assigned, pending and completed), decisions, or follow-ups, ignoring general discussion.\n\n"
+                f"Transcript:\n{chunk}"
+            )
+            response = ollama.chat(model="mistral", messages=[{"role": "user", "content": prompt}])
+            items = [item.strip() for item in response['message']['content'].split("\n") if item.strip()]
+            action_items.extend(items)
     else:
-        summary = summarizer(text, max_length=150, min_length=30, do_sample=False)
-        return summary[0]['summary_text']
+        prompt = (
+            "Extract the past, current and future action items from the following meeting transcript. "
+            "Only include key tasks (new, assigned, pending and completed), decisions, or follow-ups, ignoring general discussion.\n\n"
+            f"Transcript:\n{text}"
+        )
+        response = ollama.chat(model="mistral", messages=[{"role": "user", "content": prompt}])
+        action_items = [item.strip() for item in response['message']['content'].split("\n") if item.strip()]
+
+    # Remove duplicates
+    return list(dict.fromkeys(action_items))
 
 def main():
     if len(sys.argv) < 2:
@@ -65,11 +102,17 @@ def main():
     transcript = transcribe_audio(audio_file)
     print("\nTranscript:")
     print(transcript)
-    
+
     print("\nSummarizing transcript...")
     summary = summarize_text(transcript)
     print("\nSummary:")
     print(summary)
+
+    print("\nExtracting action items from transcript...")
+    action_items = extract_action_items(transcript)
+    print("\nAction Items:")
+    for i, item in enumerate(action_items, start=1):
+        print(f"{i}. {item}")
 
 if __name__ == "__main__":
     main()
